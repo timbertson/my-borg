@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import contextlib
 import errno
 import json
 import optparse
@@ -79,14 +80,36 @@ def _runner(fn):
 		cmd = _borg_cmd(cmd)
 		if DRY_RUN:
 			return ""
-		try:
-			return fn(cmd, env=borgenv, **k)
-		except subprocess.CalledProcessError as e:
-			raise RuntimeError("Command `%s` failed" % ' '.join(cmd[:2]))
+		return fn(cmd, env=borgenv, **k)
 	return _run
 
-borg = _runner(subprocess.check_call)
-borg_output = _runner(subprocess.check_output)
+@contextlib.contextmanager
+def terminating_popen(cmd, **k):
+	proc = subprocess.Popen(cmd, **k)
+	try:
+		result = yield proc
+		proc.wait()
+	except BaseException as e:
+		print("\nInterripted - killing PID %d" % proc.pid)
+		proc.kill()
+		raise
+
+	failure_desc = "Command `%s` failed" % ' '.join(cmd[:2])
+	if proc.statuscode != 0:
+		raise RuntimeError(failure_desc)
+	return result
+
+def check_call(cmd, **k):
+	with terminating_popen(cmd, **k):
+		pass
+
+def check_output(cmd, **k):
+	with terminating_popen(cmd, stdout=subprocess.PIPE, **k) as proc:
+		out, _err = proc.communicate()
+		return out
+
+borg = _runner(check_call)
+borg_output = _runner(check_output)
 
 def string_of_int(i):
 	return "%d" % (i,)
@@ -244,7 +267,7 @@ def backup_archive(generation, generations, extant_archives, keep):
 def backup_repo(repo, generations, keep):
 	assert isinstance(repo, Repo)
 	# XXX this is a bit rubbish...
-	borg('break-lock', repo.path)
+	# borg('break-lock', repo.path)
 
 	# TODO --list-format seemingly does nothing
 	def get_extant_archives():
