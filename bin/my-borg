@@ -158,7 +158,7 @@ class Generation(object):
 	def json(self):
 		return {
 			'generation': self.generation,
-			'date': self.time,
+			'time': self.time,
 		}
 	@property
 	def suffix(self):
@@ -292,7 +292,7 @@ def backup_repo(repo, generations, keep):
 		archive = generation.archive
 		print("\n\n ==== %s ====" % (archive.name,))
 		print("backup period: %s ( = %ss)" % (archive.config['interval'], archive.backup_interval))
-		print("last backup: %s" % (time.ctime(generation.time)))
+		print("last backup: %s (generation %d)" % (time.ctime(generation.time), generation.generation))
 		print(" -> %0.1f backup periods overdue" % (generation.backup_intervals_overdue,))
 		if not (generation.requires_backup or opts.check_only):
 			print("...skipping")
