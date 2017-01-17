@@ -15,6 +15,8 @@ p = optparse.OptionParser()
 p.add_option('--user')
 p.add_option('--dry-run', action='store_true')
 p.add_option('--all', action='store_true', help='ignore interval; backup everything')
+p.add_option('--check', action='store_true', help='check archives')
+p.add_option('--check-only', action='store_true', help='check only, don\'t create backups')
 opts, args = p.parse_args()
 assert opts.user, "--user required"
 assert len(args) == 0, "too many arguments"
@@ -30,7 +32,8 @@ expanduser = lambda p: p.replace('~', USER.pw_dir)
 confdir=expanduser('~/.config/my-borg')
 excludes_file = os.path.join(confdir, 'exclude')
 generations_file = os.path.join(confdir, 'generations.json')
-statusdir=expanduser('~/.cache/my-borg')
+statusdir = expanduser('~/.cache/my-borg')
+statusname = 'check' if opts.check_only else 'backup'
 
 borgenv = os.environ.copy()
 
@@ -64,11 +67,11 @@ def write_state(key, contents):
 		os.fchown(f.fileno(), UID, GID)
 
 def mark_progress():
-	write_state('job.pid', str(os.getpid()))
+	write_state(statusname + '.pid', string_of_int(os.getpid()))
 
 def mark_result(error):
 	contents = 'ok' if error is None else 'error %s' % (error)
-	write_state('job', contents)
+	write_state(statusname, contents)
 
 def _borg_cmd(cmd):
 	cmd = ['borg'] + list(cmd)
@@ -221,33 +224,8 @@ class Archive(object):
 	def backup_interval(self):
 		return parse_interval(self.config['interval'])
 
-def backup_archive(generation, generations, extant_archives, keep):
-	assert isinstance(generation, Generation)
-	archive = generation.archive
-	mark_progress()
-
-	generation = generation.next()
-	while generation.name in extant_archives:
-		print('...skipping %s, as it already seems present' % generation.name)
-		generation = generation.next()
-
-	borg(*['create',
-		'--stats',
-		'--verbose',
-	] + EXTRA_FLAGS + [
-		'--exclude-from', excludes_file,
-		'--exclude-if-present', '.nobackup',
-		'--one-file-system',
-		'--compression', 'zlib,6',
-		generation.full_path,
-	] + archive.paths)
-	generation.mark_complete(generations)
-
-	borg('check',
-		'--last', string_of_int(2),
-		'--prefix', archive.prefix,
-		archive.repo.path)
-
+def prune_archive(archive, keep):
+	assert isinstance(archive, Archive)
 	keep_args = []
 	for unit, quantity in keep.items():
 		keep_args.append('--keep-%s' % unit)
@@ -263,6 +241,38 @@ def backup_archive(generation, generations, extant_archives, keep):
 			'--prefix', archive.prefix,
 			archive.repo.path
 		)
+
+def backup_archive(generation, generations, extant_archives, keep):
+	assert isinstance(generation, Generation)
+	archive = generation.archive
+	mark_progress()
+
+	if not opts.check_only:
+		generation = generation.next()
+		while generation.name in extant_archives:
+			print('...skipping %s, as it already seems present' % generation.name)
+			generation = generation.next()
+
+		borg(*['create',
+			'--stats',
+			'--verbose',
+		] + EXTRA_FLAGS + [
+			'--exclude-from', excludes_file,
+			'--exclude-if-present', '.nobackup',
+			'--one-file-system',
+			'--compression', 'zlib,6',
+			generation.full_path,
+		] + archive.paths)
+		generation.mark_complete(generations)
+
+	if opts.check or opts.check_only:
+		borg('check',
+			'--last', string_of_int(2),
+			'--prefix', archive.prefix,
+			archive.repo.path)
+
+	if not opts.check_only:
+		prune_archive(archive, keep=keep)
 
 def backup_repo(repo, generations, keep):
 	assert isinstance(repo, Repo)
@@ -284,7 +294,7 @@ def backup_repo(repo, generations, keep):
 		print("backup period: %s ( = %ss)" % (archive.config['interval'], archive.backup_interval))
 		print("last backup: %s" % (time.ctime(generation.time)))
 		print(" -> %0.1f backup periods overdue" % (generation.backup_intervals_overdue,))
-		if not generation.requires_backup:
+		if not (generation.requires_backup or opts.check_only):
 			print("...skipping")
 			continue
 		backup_archive(generation,
