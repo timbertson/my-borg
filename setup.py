@@ -13,7 +13,7 @@ setup(
 	version=read('VERSION'),
 	description='TODO',
 	packages=find_packages(exclude=['doc', 'test']),
-	install_requires=['borg'],
+	# install_requires=['borgbackup'],
 	scripts=['bin/my-borg'],
 )
 

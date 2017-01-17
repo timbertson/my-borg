@@ -1,38 +1,62 @@
 #!/usr/bin/env python3
 
-import os, sys, re, subprocess, json, errno, pwd, optparse
-
-DRY_RUN = False
-DRY_RUN_ARGS = ['--dry-run'] if DRY_RUN else []
+import errno
+import json
+import optparse
+import os
+import pwd
+import re
+import subprocess
+import sys
+import time
 
 p = optparse.OptionParser()
 p.add_option('--user')
 p.add_option('--dry-run', action='store_true')
+p.add_option('--all', action='store_true', help='ignore interval; backup everything')
 opts, args = p.parse_args()
 assert opts.user, "--user required"
 assert len(args) == 0, "too many arguments"
 
+DRY_RUN = opts.dry_run
+EXTRA_FLAGS = ['--progress'] if sys.stdin.isatty else []
+
+NOW = time.time()
 USER = pwd.getpwnam(opts.user)
 UID = USER.pw_uid
 GID = USER.pw_gid
 expanduser = lambda p: p.replace('~', USER.pw_dir)
 confdir=expanduser('~/.config/my-borg')
-
+excludes_file = os.path.join(confdir, 'exclude')
+generations_file = os.path.join(confdir, 'generations.json')
 statusdir=expanduser('~/.cache/my-borg')
-if not os.path.exists(statusdir):
-	os.mkdir(statusdir)
-os.chown(statusdir, UID, GID)
 
-def clear_state(key):
-	try:
-		os.unlink(os.path.join(statusdir, key))
-	except OSError as e:
-		if e.errno == errno.ENOENT:
-			pass
-		else:
-			raise
+borgenv = os.environ.copy()
+
+def parse_interval(spec):
+	quantity, unit = list(filter(None, re.split('(\d+) *', spec)))
+	quantity = int(quantity)
+	if unit in ['s', 'second', 'seconds']: return quantity
+	quantity *= 60
+	if unit in ['m', 'minute', 'minutes']: return quantity
+	quantity *= 60
+	if unit in ['h', 'hour', 'hours']: return quantity
+	quantity *= 24
+	if unit in ['d', 'day', 'days']: return quantity
+	quantity *= 7
+	if unit in ['w', 'week', 'weeks']: return quantity
+	raise AssertionError("Can't parse quantity %s" % (spec,))
+
+if not DRY_RUN:
+	borgenv['BORG_PASSPHRASE'] = open(os.path.join(confdir, 'passphrase')).read().strip()
+	if not os.path.exists(statusdir):
+		os.mkdir(statusdir)
+	os.chown(statusdir, UID, GID)
 
 def write_state(key, contents):
+	if DRY_RUN:
+		print('would write to %s state file: %s' % (key, contents))
+		return
 	path = os.path.join(statusdir, key)
 	with open(path, 'w') as f:
 		f.write(contents)
@@ -45,10 +69,215 @@ def mark_result(error):
 	contents = 'ok' if error is None else 'error %s' % (error)
 	write_state('job', contents)
 
-def prefix(archive):
-	return archive+'.'
+def _borg_cmd(cmd):
+	cmd = ['borg'] + list(cmd)
+	print('+ %s' % ' '.join(cmd))
+	return cmd
+
+def _runner(fn):
+	def _run(*cmd, **k):
+		cmd = _borg_cmd(cmd)
+		if DRY_RUN:
+			return ""
+		try:
+			return fn(cmd, env=borgenv, **k)
+		except subprocess.CalledProcessError as e:
+			raise RuntimeError("Command `%s` failed" % ' '.join(cmd[:2]))
+	return _run
+
+borg = _runner(subprocess.check_call)
+borg_output = _runner(subprocess.check_output)
+
+def string_of_int(i):
+	return "%d" % (i,)
 
 class Skip(RuntimeError): pass
+
+class Repo(object):
+	def __init__(self, config):
+		self.config = config
+		self.path = self.config['path']
+		self.archives = [
+			Archive(self, archive)
+			for archive in self.config['archives']
+		]
+
+class Generation(object):
+	@classmethod
+	def from_json(cls, archive, data):
+		if data is None:
+			data = {}
+		elif isinstance(data, int):
+			data = { 'generation': data }
+
+		generation = data.get('generation', 0)
+		time = data.get('time', 0)
+		return cls(archive=archive, generation=generation, time=time)
+
+	def __init__(self, archive, generation, time):
+		assert isinstance(generation, int)
+		assert isinstance(archive, Archive)
+		self.archive = archive
+		self.generation = generation
+		self.time = time
+	
+	def next(self):
+		return Generation(
+			archive = self.archive,
+			generation = self.generation + 1,
+			time = time.time()
+		)
+
+	@property
+	def json(self):
+		return {
+			'generation': self.generation,
+			'date': self.time,
+		}
+	@property
+	def suffix(self):
+		return ('.%d' % self.generation)
+
+	@property
+	def name(self):
+		return self.archive.name + self.suffix
+
+	@property
+	def full_path(self):
+		return self.archive.repo.path + '::' + self.name
+
+	@property
+	def requires_backup(self):
+		if opts.all:
+			return True
+		return self.age > (self.archive.backup_interval / 2)
+
+	@property
+	def age(self):
+		diff = NOW - self.time
+		assert diff >= 0, diff
+		return diff
+
+	@property
+	def backup_intervals_overdue(self):
+		return self.age / max(1, self.archive.backup_interval)
+
+	def mark_complete(self, generations):
+		generations[self.archive.name] = self.json
+
+		if DRY_RUN:
+			print("dry run - not saving generations: %r" % generations)
+			return
+
+		tmp = generations_file + '.tmp'
+		with open(tmp, 'w') as f:
+			json.dump(generations, f, indent=2, sort_keys=True)
+			os.fchown(f.fileno(), UID, GID)
+		os.rename(tmp, generations_file)
+
+class Archive(object):
+	def __init__(self, repo, config):
+		assert isinstance(repo, Repo)
+		self.repo = repo
+		self.config = config
+		self.paths = self.get_paths()
+		self.name = self.config['name']
+		self.prefix = self.name + '.'
+	
+	def get_paths(self):
+		paths = self.config['paths']
+		if not isinstance(paths, list):
+			paths = [paths]
+		return list(map(expanduser, paths))
+
+	def load_generation(self, generations):
+		data = generations.get(self.name, None)
+		return Generation.from_json(self, data)
+
+	@property
+	def backup_interval(self):
+		return parse_interval(self.config['interval'])
+
+def backup_archive(generation, generations, extant_archives, keep):
+	assert isinstance(generation, Generation)
+	archive = generation.archive
+	mark_progress()
+
+	generation = generation.next()
+	while generation.name in extant_archives:
+		print('...skipping %s, as it already seems present' % generation.name)
+		generation = generation.next()
+
+	borg(*['create',
+		'--stats',
+		'--verbose',
+	] + EXTRA_FLAGS + [
+		'--exclude-from', excludes_file,
+		'--exclude-if-present', '.nobackup',
+		'--one-file-system',
+		'--compression', 'zlib,6',
+		generation.full_path,
+	] + archive.paths)
+	generation.mark_complete(generations)
+
+	borg('check',
+		'--last', string_of_int(2),
+		'--prefix', archive.prefix,
+		archive.repo.path)
+
+	keep_args = []
+	for unit, quantity in keep.items():
+		keep_args.append('--keep-%s' % unit)
+		keep_args.append(string_of_int(quantity))
+
+	if keep_args:
+		borg('prune',
+			'--verbose',
+			'--list',
+			# '--keep-hourly', '1',
+			'--keep-daily', '7',
+			# '--keep-weekly', '3',
+			'--prefix', archive.prefix,
+			archive.repo.path
+		)
+
+def backup_repo(repo, generations, keep):
+	assert isinstance(repo, Repo)
+	# XXX this is a bit rubbish...
+	borg('break-lock', repo.path)
+
+	# TODO --list-format seemingly does nothing
+	def get_extant_archives():
+		lines = borg_output('list', repo.path).splitlines()
+		return [line.decode('utf-8').split()[0] for line in lines]
+	extant_archives = get_extant_archives()
+
+	archive_generations = [archive.load_generation(generations) for archive in repo.archives]
+	archive_generations = sorted(archive_generations, key = lambda gen: gen.backup_intervals_overdue, reverse=True)
+
+	for generation in archive_generations:
+		archive = generation.archive
+		print("\n\n ==== %s ====" % (archive.name,))
+		print("backup period: %s ( = %ss)" % (archive.config['interval'], archive.backup_interval))
+		print("last backup: %s" % (time.ctime(generation.time)))
+		print(" -> %0.1f backup periods overdue" % (generation.backup_intervals_overdue,))
+		if not generation.requires_backup:
+			print("...skipping")
+			continue
+		backup_archive(generation,
+			generations=generations,
+			extant_archives=extant_archives,
+			keep = keep,
+		)
+
+	for archive_name in extant_archives:
+		print(" - %s" % archive_name)
+		used = any(
+			[archive_name.startswith(archive.prefix) for archive in repo.archives]
+		)
+		if not used:
+			print("deleting unknown archive: %s" % archive_name)
+			borg("delete", repo.path + '::' + archive_name)
 
 def main():
 	with open(os.path.join(confdir, 'config.json')) as f:
@@ -59,125 +288,33 @@ def main():
 			lines.append(line)
 		config = json.loads(''.join(lines))
 
-	paths = [repo['path'] for repo in config['repos']]
+	try:
+		with open(generations_file) as f:
+			generations = json.load(f)
+	except OSError as e:
+		if e.errno == errno.ENOENT:
+			generations = {}
+		else:
+			raise
+
+	repos = list(map(Repo, config['repos']))
+	
+	keep = config.get('keep', None)
+	assert keep, "`keep` configuration required"
+
+	paths = [repo.path for repo in repos]
 	if not any(map(os.path.exists, paths)):
 		print("Warning: no paths are currently present; skipping")
 		raise Skip()
 
-	for repo in config['repos']:
-		BORG_ROOT = repo['path']
-		ARCHIVES = repo['archives']
+	for repo in repos:
+		for archive in repo.archives:
+			for path in archive.paths:
+				if not os.path.exists(path):
+					raise AssertionError("no such path: %s" % path)
 
-		for archive in ARCHIVES:
-			paths = archive['paths']
-			if not isinstance(paths, list):
-				paths = [paths]
-			archive['paths'] = list(map(expanduser, paths))
-
-		excludes_file = os.path.join(confdir, 'exclude')
-		generations_file = os.path.join(confdir, 'generations.json')
-
-		try:
-			with open(generations_file) as f:
-				generations = json.load(f)
-		except OSError as e:
-			if e.errno == errno.ENOENT:
-				generations = {}
-			else:
-				raise
-
-		def save_generations():
-			tmp = generations_file + '.tmp'
-			with open(tmp, 'w') as f:
-				json.dump(generations, f, indent=2, sort_keys=True)
-				os.fchown(f.fileno(), UID, GID)
-			os.rename(tmp, generations_file)
-
-		borgenv = os.environ.copy()
-		borgenv['BORG_PASSPHRASE'] = open(os.path.join(confdir, 'passphrase')).read().strip()
-
-		EXTRA_FLAGS = ['--progress'] if sys.stdin.isatty else []
-
-		def _borg_cmd(cmd):
-			cmd = ['borg'] + list(cmd)
-			print('+ %s' % ' '.join(cmd))
-			return cmd
-
-		def _runner(fn):
-			def _run(*cmd, **k):
-				cmd = _borg_cmd(cmd)
-				try:
-					return fn(cmd, env=borgenv, **k)
-				except subprocess.CalledProcessError as e:
-					raise RuntimeError("Command `%s` failed" % ' '.join(cmd[:2]))
-			return _run
-
-		borg = _runner(subprocess.check_call)
-		borg_output = _runner(subprocess.check_output)
-
-		# XXX this is a bit rubbish...
-		borg('break-lock', BORG_ROOT)
-
-		# TODO --list-format seemingly does nothing
-		def get_extant_archives():
-			lines = borg_output('list', BORG_ROOT).splitlines()
-			return [line.decode('utf-8').split()[0] for line in lines]
-		extant_archives = get_extant_archives()
-
-		for archive in ARCHIVES:
-			mark_progress()
-			archive_name = archive['name']
-			paths = archive['paths']
-
-			print("\n\n ==== %s ====" % (archive_name,))
-			gen = generations.get(archive_name, 0) + 1
-			def archive_generation(gen):
-				return  archive_name + ('.%d' % gen)
-			while archive_generation(gen) in extant_archives:
-				print('...skipping %s, as it already seems present' % archive_generation(gen))
-				gen += 1
-
-			borg('create',
-				'--stats',
-				'--verbose',
-				*EXTRA_FLAGS,
-				'--exclude-from', excludes_file,
-				'--exclude-if-present', '.nobackup',
-				'--one-file-system',
-				'--compression', 'zlib,6',
-				BORG_ROOT+'::' + archive_generation(gen),
-				*paths
-			)
-			generations[archive_name] = gen
-			save_generations()
-
-			borg('check',
-				'--last', '2',
-				'--prefix', prefix(archive_name),
-				BORG_ROOT)
-
-			borg('prune',
-				*DRY_RUN_ARGS,
-				'--verbose',
-				'--list',
-				# '--keep-hourly', '1',
-				'--keep-daily', '7',
-				# '--keep-weekly', '3',
-				'--prefix', prefix(archive_name),
-				BORG_ROOT
-			)
-
-		for archive_name in extant_archives:
-			print(" - %s" % archive_name)
-			used = False
-			for key in [archive['name'] for archive in ARCHIVES]:
-				if archive_name.startswith(prefix(key)):
-					used = True
-					break
-			if not used:
-				print("deleting unknown archive: %s" % archive_name)
-				if not DRY_RUN:
-					borg("delete", BORG_ROOT + '::' + archive_name)
+	for repo in repos:
+		backup_repo(repo, generations=generations, keep=keep)
 
 try:
 	mark_progress()
