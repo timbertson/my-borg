@@ -8,6 +8,7 @@ import os
 import pwd
 import re
 import subprocess
+import shutil
 import sys
 import time
 
@@ -98,7 +99,7 @@ def terminating_popen(cmd, **k):
 		raise
 
 	failure_desc = "Command `%s` failed" % ' '.join(cmd[:2])
-	if proc.statuscode != 0:
+	if proc.returncode != 0:
 		raise RuntimeError(failure_desc)
 	return result
 
@@ -313,6 +314,7 @@ def backup_repo(repo, generations, keep):
 			borg("delete", repo.path + '::' + archive_name)
 
 def main():
+	print("`borg` executable: %s" % (shutil.which('borg')))
 	with open(os.path.join(confdir, 'config.json')) as f:
 		lines = []
 		for line in f:
