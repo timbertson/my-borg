@@ -12,18 +12,34 @@ import shutil
 import sys
 import time
 
-p = optparse.OptionParser()
+p = optparse.OptionParser("Usage: %prog [OPTIONS] <backup|check|sync>")
 p.add_option('--user')
 p.add_option('--dry-run', action='store_true')
+p.add_option('--progress', action='store_true', help='show --progress when creating archives')
 p.add_option('--all', action='store_true', help='ignore interval; backup everything')
-p.add_option('--check', action='store_true', help='check archives')
-p.add_option('--check-only', action='store_true', help='check only, don\'t create backups')
-opts, args = p.parse_args()
+p.add_option('--check', action='store_true', help='check archives as part of backup')
+p.add_option('--no-prune', action='store_true', help='don\'t prune old archives')
+p.add_option('--status-dir', default='~/.cache/my-borg/', help='status directory (default: %default)')
+p.add_option('--status-file', default=None, help='status file (default: %default)')
+p.add_option('--only', action='append', default=[], help='only act on this repo (may be given multiple times)')
+p.add_option('--exclude', action='append', default=[], help='exclude this repo (may be given multiple times)')
+opts, actions = p.parse_args()
 assert opts.user, "--user required"
-assert len(args) == 0, "too many arguments"
+assert actions, 'action required'
 
 DRY_RUN = opts.dry_run
-EXTRA_FLAGS = ['--progress'] if sys.stdin.isatty else []
+
+def should_include_repo(repo):
+	if opts.only:
+		if repo.name not in opts.only:
+			print("Excluding repo %s (does not match --only)" % repo.name)
+			return False
+	elif opts.exclude:
+		if repo.name in opts.exclude:
+			print("Excluding repo %s (matches --exclude)" % repo.name)
+			return False
+	return True
+
 
 NOW = time.time()
 USER = pwd.getpwnam(opts.user)
@@ -33,8 +49,8 @@ expanduser = lambda p: p.replace('~', USER.pw_dir)
 confdir=expanduser('~/.config/my-borg')
 excludes_file = os.path.join(confdir, 'exclude')
 generations_file = os.path.join(confdir, 'generations.json')
-statusdir = expanduser('~/.cache/my-borg')
-statusname = 'check' if opts.check_only else 'backup'
+statusdir = expanduser(opts.status_dir)
+statusfile = os.path.join(statusdir, opts.status_file) if opts.status_file else None
 
 borgenv = os.environ.copy()
 
@@ -53,39 +69,49 @@ def parse_interval(spec):
 	raise AssertionError("Can't parse quantity %s" % (spec,))
 
 if not DRY_RUN:
-	borgenv['BORG_PASSPHRASE'] = open(os.path.join(confdir, 'passphrase')).read().strip()
 	if not os.path.exists(statusdir):
 		os.mkdir(statusdir)
 	os.chown(statusdir, UID, GID)
 
-def write_state(key, contents):
-	if DRY_RUN:
-		print('would write to %s state file: %s' % (key, contents))
+def write_state(ext, contents):
+	if not statusfile:
 		return
-	path = os.path.join(statusdir, key)
+	path = statusfile
+	if ext:
+		path += ext
+	if DRY_RUN:
+		print('would write to %s state file: %s' % (path, contents))
+		return
 	with open(path, 'w') as f:
 		f.write(contents)
 		os.fchown(f.fileno(), UID, GID)
 
 def mark_progress():
-	write_state(statusname + '.pid', string_of_int(os.getpid()))
+	write_state('.pid', string_of_int(os.getpid()))
 
 def mark_result(error):
 	contents = 'ok' if error is None else 'error %s' % (error)
-	write_state(statusname, contents)
+	write_state(None, contents)
 
-def _borg_cmd(cmd):
-	cmd = ['borg'] + list(cmd)
+def _cmd(cmd):
+	cmd = list(cmd)
 	print('+ %s' % ' '.join(cmd))
 	return cmd
 
 def _runner(fn):
 	def _run(*cmd, **k):
-		cmd = _borg_cmd(cmd)
+		cmd = _cmd(cmd)
 		if DRY_RUN:
 			return ""
-		return fn(cmd, env=borgenv, **k)
+		return fn(cmd, **k)
 	return _run
+
+def _borg_runner(fn):
+	def run(cmd, **k):
+		if not DRY_RUN and 'BORG_PASSPHRASE' not in borgenv:
+			borgenv['BORG_PASSPHRASE'] = open(os.path.join(confdir, 'passphrase')).read().strip()
+		return fn(cmd, env=borgenv, **k)
+	return _runner(run)
 
 @contextlib.contextmanager
 def terminating_popen(cmd, **k):
@@ -103,17 +129,19 @@ def terminating_popen(cmd, **k):
 		raise RuntimeError(failure_desc)
 	return result
 
-def check_call(cmd, **k):
+def _check_call(cmd, **k):
 	with terminating_popen(cmd, **k):
 		pass
 
-def check_output(cmd, **k):
+def _check_output(cmd, **k):
 	with terminating_popen(cmd, stdout=subprocess.PIPE, **k) as proc:
 		out, _err = proc.communicate()
 		return out
 
-borg = _runner(check_call)
-borg_output = _runner(check_output)
+check_borg_call = _borg_runner(_check_call)
+check_borg_output = _borg_runner(_check_output)
+check_call = _runner(_check_call)
+check_output = _runner(_check_output)
 
 def string_of_int(i):
 	return "%d" % (i,)
@@ -121,15 +149,69 @@ def string_of_int(i):
 class Skip(RuntimeError): pass
 
 class Repo(object):
-	def __init__(self, config):
+	def __init__(self, config, global_config):
+		self.global_config = global_config
 		self.config = config
 		self.path = self.config['path']
+		self.name = self.config['name']
 		self.archives = [
 			Archive(self, archive)
 			for archive in self.config['archives']
 		]
 
-class Generation(object):
+	@property
+	def sync_config(self):
+		return self.config.get('sync')
+
+	@property
+	def bwlimit(self):
+		return self.global_config.get('bwlimit')
+
+class BaseGeneration(object):
+	@property
+	def requires_backup(self):
+		if opts.all:
+			return True
+		return self.age > self.backup_interval
+
+	@property
+	def age(self):
+		diff = NOW - self.time
+		assert diff >= 0, diff
+		return diff
+
+	@property
+	def backup_intervals_overdue(self):
+		return self.age / max(1, self.backup_interval)
+
+	def print_completion_stats(self):
+		print("last completion: %s" % (time.ctime(self.time)))
+		print(" -> %0.1f backup periods overdue" % (self.backup_intervals_overdue,))
+
+class SyncGeneration(BaseGeneration):
+	@classmethod
+	def from_json(cls, config, state):
+		time = state
+		if time is None:
+			time = 0
+		return cls(config=config, time=time)
+
+	def __init__(self, config, time):
+		self.config = config
+		self.time = time
+
+	@property
+	def json(self):
+		return self.time
+
+	def next(self):
+		return SyncGeneration(config=self.config, time = time.time())
+
+	@property
+	def backup_interval(self):
+		return parse_interval(self.config['interval'])
+
+class ArchiveGeneration(BaseGeneration):
 	@classmethod
 	def from_json(cls, archive, data):
 		if data is None:
@@ -149,7 +231,7 @@ class Generation(object):
 		self.time = time
 	
 	def next(self):
-		return Generation(
+		return ArchiveGeneration(
 			archive = self.archive,
 			generation = self.generation + 1,
 			time = time.time()
@@ -161,6 +243,7 @@ class Generation(object):
 			'generation': self.generation,
 			'time': self.time,
 		}
+
 	@property
 	def suffix(self):
 		return ('.%d' % self.generation)
@@ -172,33 +255,59 @@ class Generation(object):
 	@property
 	def full_path(self):
 		return self.archive.repo.path + '::' + self.name
-
+	
 	@property
-	def requires_backup(self):
-		if opts.all:
-			return True
-		return self.age > (self.archive.backup_interval / 2)
+	def backup_interval(self):
+		return self.archive.backup_interval
 
-	@property
-	def age(self):
-		diff = NOW - self.time
-		assert diff >= 0, diff
-		return diff
+class Generations(object):
+	def __init__(self, data):
+		self.data = data
 
-	@property
-	def backup_intervals_overdue(self):
-		return self.age / max(1, self.archive.backup_interval)
+	@classmethod
+	def try_load(cls, path):
+		try:
+			with open(generations_file) as f:
+				data = json.load(f)
+		except OSError as e:
+			if e.errno == errno.ENOENT:
+				data = {}
+			else:
+				raise
+		return cls(data)
 
-	def mark_complete(self, generations):
-		generations[self.archive.name] = self.json
+	def get(self, path, dfl):
+		rv = self.data
+		for key in path:
+			try:
+				rv = rv[key]
+			except KeyError:
+				return dfl
+		return rv
 
+	def set(self, path, contents):
+		assert isinstance(contents, BaseGeneration), contents
+		contents = contents.json
+		parent = self.data
+		path = path[:]
+		leaf = path.pop()
+		for key in path:
+			try:
+				parent = parent[key]
+			except KeyError:
+				child = {}
+				parent[key] = child
+				parent = child
+		parent[leaf] = contents
+
+	def save(self):
 		if DRY_RUN:
-			print("dry run - not saving generations: %r" % generations)
+			print("dry run - not saving generations: %r" % self.data)
 			return
 
 		tmp = generations_file + '.tmp'
 		with open(tmp, 'w') as f:
-			json.dump(generations, f, indent=2, sort_keys=True)
+			json.dump(self.data, f, indent=2, sort_keys=True)
 			os.fchown(f.fileno(), UID, GID)
 		os.rename(tmp, generations_file)
 
@@ -218,8 +327,14 @@ class Archive(object):
 		return list(map(expanduser, paths))
 
 	def load_generation(self, generations):
-		data = generations.get(self.name, None)
-		return Generation.from_json(self, data)
+		data = generations.get(['archive', self.name], None)
+		return ArchiveGeneration.from_json(self, data)
+
+	def save_generation(self, generations, generation):
+		assert isinstance(generations, Generations)
+		assert isinstance(generation, ArchiveGeneration)
+		generations.set(['archive', self.name], generation)
+		generations.save()
 
 	@property
 	def backup_interval(self):
@@ -233,7 +348,8 @@ def prune_archive(archive, keep):
 		keep_args.append(string_of_int(quantity))
 
 	if keep_args:
-		borg('prune',
+		check_borg_call('borg',
+			'prune',
 			'--verbose',
 			'--list',
 			# '--keep-hourly', '1',
@@ -243,46 +359,86 @@ def prune_archive(archive, keep):
 			archive.repo.path
 		)
 
+def check_archive(archive, num_to_check):
+	check_borg_call('borg',
+		'check',
+		'--last', string_of_int(num_to_check),
+		'--prefix', archive.prefix,
+		archive.repo.path)
+
+def check_repo(repo):
+	for archive in repo.archives:
+		check_archive(archive, 1)
+
+def sync_repo(repo, generations):
+	print("\n\n ==== sync: %s ====" % (repo.name,))
+	config = repo.sync_config
+	if config is False:
+		print("...skipping %s" % repo.path)
+		return
+	config_file = os.path.join(confdir, config['config'])
+	generation = SyncGeneration.from_json(
+		config = config,
+		state = generations.get(['sync', repo.name], None)
+	)
+
+	print("backup period: %s ( = %ss)" % (config['interval'], generation.backup_interval))
+	generation.print_completion_stats()
+	if not (generation.requires_backup or opts.all):
+		print("...skipping")
+		return
+
+	cmd = (['rclone', 'sync',
+			'--config', config_file,
+			'--delete-after'
+		] +
+		(['--bwlimit', repo.bwlimit] if repo.bwlimit is not None else [])
+		+ [
+			repo.path,
+			config['name'],
+		]
+	)
+
+	check_call(*cmd,
+		cwd=confdir
+	)
+	generations.set(['sync', repo.name], generation.next())
+	generations.save()
+
 def backup_archive(generation, generations, extant_archives, keep):
-	assert isinstance(generation, Generation)
+	assert isinstance(generation, ArchiveGeneration)
 	archive = generation.archive
 	mark_progress()
 
-	if not opts.check_only:
+	generation = generation.next()
+	while generation.name in extant_archives:
+		print('...skipping %s, as it already seems present' % generation.name)
 		generation = generation.next()
-		while generation.name in extant_archives:
-			print('...skipping %s, as it already seems present' % generation.name)
-			generation = generation.next()
 
-		borg(*['create',
-			'--stats',
-			'--verbose',
-		] + EXTRA_FLAGS + [
-			'--exclude-from', excludes_file,
-			'--exclude-if-present', '.nobackup',
-			'--one-file-system',
-			'--compression', 'zlib,6',
-			generation.full_path,
-		] + archive.paths)
-		generation.mark_complete(generations)
+	check_borg_call(*['borg',
+		'create',
+		'--stats',
+		'--verbose',
+	] + (['--progress', '--verbose'] if opts.progress else []) + [
+		'--exclude-from', excludes_file,
+		'--exclude-if-present', '.nobackup',
+		'--one-file-system',
+		'--compression', 'zlib,6',
+		generation.full_path,
+	] + archive.paths)
+	archive.save_generation(generations, generation)
 
-	if opts.check or opts.check_only:
-		borg('check',
-			'--last', string_of_int(2),
-			'--prefix', archive.prefix,
-			archive.repo.path)
+	if opts.check:
+		check_archive(archive, 1)
 
-	if not opts.check_only:
+	if not opts.no_prune:
 		prune_archive(archive, keep=keep)
 
 def backup_repo(repo, generations, keep):
 	assert isinstance(repo, Repo)
-	# XXX this is a bit rubbish...
-	# borg('break-lock', repo.path)
-
 	# TODO --list-format seemingly does nothing
 	def get_extant_archives():
-		lines = borg_output('list', repo.path).splitlines()
+		lines = check_borg_output('borg', 'list', repo.path).splitlines()
 		return [line.decode('utf-8').split()[0] for line in lines]
 	extant_archives = get_extant_archives()
 
@@ -291,11 +447,11 @@ def backup_repo(repo, generations, keep):
 
 	for generation in archive_generations:
 		archive = generation.archive
-		print("\n\n ==== %s ====" % (archive.name,))
+		print("\n\n ==== backup: %s ====" % (archive.name,))
 		print("backup period: %s ( = %ss)" % (archive.config['interval'], archive.backup_interval))
-		print("last backup: %s (generation %d)" % (time.ctime(generation.time), generation.generation))
-		print(" -> %0.1f backup periods overdue" % (generation.backup_intervals_overdue,))
-		if not (generation.requires_backup or opts.check_only):
+		print("current generation: %d" % (generation.generation))
+		generation.print_completion_stats()
+		if not (generation.requires_backup or opts.all):
 			print("...skipping")
 			continue
 		backup_archive(generation,
@@ -311,10 +467,12 @@ def backup_repo(repo, generations, keep):
 		)
 		if not used:
 			print("deleting unknown archive: %s" % archive_name)
-			borg("delete", repo.path + '::' + archive_name)
+			check_borg_call('borg', 'delete', repo.path + '::' + archive_name)
 
 def main():
-	print("`borg` executable: %s" % (shutil.which('borg')))
+	print(" == executables: == ")
+	for exe in ['borg','rclone']:
+		print(' - %s: %s' % (exe, shutil.which(exe)))
 	with open(os.path.join(confdir, 'config.json')) as f:
 		lines = []
 		for line in f:
@@ -323,40 +481,58 @@ def main():
 			lines.append(line)
 		config = json.loads(''.join(lines))
 
-	try:
-		with open(generations_file) as f:
-			generations = json.load(f)
-	except OSError as e:
-		if e.errno == errno.ENOENT:
-			generations = {}
-		else:
-			raise
+	generations = Generations.try_load(generations_file)
+	repos = list(map(lambda repo_config: Repo(repo_config, config), config['repos']))
 
-	repos = list(map(Repo, config['repos']))
+	repos = list(filter(should_include_repo, repos))
+	if not repos:
+		raise AssertionError("no repositories matched the given --include / --exclude options")
 	
 	keep = config.get('keep', None)
 	assert keep, "`keep` configuration required"
 
 	paths = [repo.path for repo in repos]
 	if not any(map(os.path.exists, paths)):
-		print("Warning: no paths are currently present; skipping")
-		raise Skip()
+		raise Skip("no paths are currently present; skipping")
+
+	def make_uniqueness_checker(desc):
+		lst = []
+		def check(val):
+			if val in lst:
+				raise AssertionError("Duplicate %s: %s" % desc, val)
+			lst.append(val)
+		return check
+	
+	check_repo_name = make_uniqueness_checker('repo name')
+	check_archive_name = make_uniqueness_checker('archive name')
 
 	for repo in repos:
+		check_repo_name(repo.name)
 		for archive in repo.archives:
+			check_archive_name(archive.name)
 			for path in archive.paths:
 				if not os.path.exists(path):
 					raise AssertionError("no such path: %s" % path)
 
-	for repo in repos:
-		backup_repo(repo, generations=generations, keep=keep)
+	ACTIONS = {
+		'backup': lambda repo: backup_repo(repo, generations=generations, keep=keep),
+		'check': check_repo,
+		'sync': lambda repo: sync_repo(repo, generations=generations),
+	}
+	action_fns = [ACTIONS[action] for action in actions]
+
+	for action in action_fns:
+		for repo in repos:
+			action(repo)
 
 try:
 	mark_progress()
 	main()
 	mark_result(error = None)
-except Skip:
-	pass
 except Exception as e:
 	mark_result(error = str(e))
-	raise
+	if isinstance(e, Skip):
+		print("Warning: %s" % (e,))
+		sys.exit(1)
+	else:
+		raise
