@@ -108,8 +108,11 @@ def _runner(fn):
 
 def _borg_runner(fn):
 	def run(cmd, **k):
-		if not DRY_RUN and 'BORG_PASSPHRASE' not in borgenv:
-			borgenv['BORG_PASSPHRASE'] = open(os.path.join(confdir, 'passphrase')).read().strip()
+		if not DRY_RUN:
+			if 'BORG_PASSPHRASE' not in borgenv:
+				borgenv['BORG_PASSPHRASE'] = open(os.path.join(confdir, 'passphrase')).read().strip()
+			if 'BORG_RSH' not in borgenv:
+				borgenv['BORG_RSH'] = "ssh -i %s" % (expanduser('~/.ssh/id_rsa'),)
 		return fn(cmd, env=borgenv, **k)
 	return _runner(run)
 
@@ -154,10 +157,21 @@ class Repo(object):
 		self.config = config
 		self.path = self.config['path']
 		self.name = self.config['name']
+		self.compression = self.config.get('compression', 'zlib,6')
 		self.archives = [
 			Archive(self, archive)
 			for archive in self.config['archives']
 		]
+
+	def path_exists(self):
+		if '@' in self.path:
+			return True # remote path
+		else:
+			return os.path.exists(self.path)
+
+	@property
+	def identity(self):
+		return '%s:%s' % (self.path, self.name)
 
 	@property
 	def sync_config(self):
@@ -318,6 +332,7 @@ class Archive(object):
 		self.config = config
 		self.paths = self.get_paths()
 		self.name = self.config['name']
+		self.identity = repo.path + '::' + self.name
 		self.prefix = self.name + '.'
 	
 	def get_paths(self):
@@ -327,13 +342,13 @@ class Archive(object):
 		return list(map(expanduser, paths))
 
 	def load_generation(self, generations):
-		data = generations.get(['archive', self.name], None)
+		data = generations.get(['archive', self.identity], None)
 		return ArchiveGeneration.from_json(self, data)
 
 	def save_generation(self, generations, generation):
 		assert isinstance(generations, Generations)
 		assert isinstance(generation, ArchiveGeneration)
-		generations.set(['archive', self.name], generation)
+		generations.set(['archive', self.identity], generation)
 		generations.save()
 
 	@property
@@ -423,7 +438,7 @@ def backup_archive(generation, generations, extant_archives, keep):
 		'--exclude-from', excludes_file,
 		'--exclude-if-present', '.nobackup',
 		'--one-file-system',
-		'--compression', 'zlib,6',
+		'--compression', archive.repo.compression,
 		generation.full_path,
 	] + archive.paths)
 	archive.save_generation(generations, generation)
@@ -433,6 +448,13 @@ def backup_archive(generation, generations, extant_archives, keep):
 
 	if not opts.no_prune:
 		prune_archive(archive, keep=keep)
+
+def init_repo(repo, generations, keep):
+	try:
+		check_borg_call('borg', 'init', '--encryption=repokey-blake2', repo.path)
+	except RuntimeError:
+		# assume already initted
+		pass
 
 def backup_repo(repo, generations, keep):
 	assert isinstance(repo, Repo)
@@ -447,7 +469,7 @@ def backup_repo(repo, generations, keep):
 
 	for generation in archive_generations:
 		archive = generation.archive
-		print("\n\n ==== backup: %s ====" % (archive.name,))
+		print("\n\n ==== backup: %s (%s) ====" % (archive.name, archive.identity))
 		print("backup period: %s ( = %ss)" % (archive.config['interval'], archive.backup_interval))
 		print("current generation: %d" % (generation.generation))
 		generation.print_completion_stats()
@@ -487,27 +509,26 @@ def main():
 	repos = list(filter(should_include_repo, repos))
 	if not repos:
 		raise AssertionError("no repositories matched the given --include / --exclude options")
+
+	skipped_repos = list(filter(lambda repo: not repo.path_exists(), repos))
+	repos = list(filter(Repo.path_exists, repos))
 	
 	keep = config.get('keep', None)
 	assert keep, "`keep` configuration required"
-
-	paths = [repo.path for repo in repos]
-	if not any(map(os.path.exists, paths)):
-		raise Skip("no paths are currently present; skipping")
 
 	def make_uniqueness_checker(desc):
 		lst = []
 		def check(val):
 			if val in lst:
-				raise AssertionError("Duplicate %s: %s" % desc, val)
+				raise AssertionError("Duplicate %s: %s" % (desc, val))
 			lst.append(val)
 		return check
 	
 	check_repo_name = make_uniqueness_checker('repo name')
-	check_archive_name = make_uniqueness_checker('archive name')
 
 	for repo in repos:
-		check_repo_name(repo.name)
+		check_repo_name(repo.identity)
+		check_archive_name = make_uniqueness_checker('archive name')
 		for archive in repo.archives:
 			check_archive_name(archive.name)
 			for path in archive.paths:
@@ -515,6 +536,7 @@ def main():
 					raise AssertionError("no such path: %s" % path)
 
 	ACTIONS = {
+		'init': lambda repo: init_repo(repo, generations=generations, keep=keep),
 		'backup': lambda repo: backup_repo(repo, generations=generations, keep=keep),
 		'check': check_repo,
 		'sync': lambda repo: sync_repo(repo, generations=generations),
@@ -524,6 +546,9 @@ def main():
 	for action in action_fns:
 		for repo in repos:
 			action(repo)
+
+	if skipped_repos:
+		raise Skip("Skipped paths: %r" % (skipped_repos))
 
 try:
 	mark_progress()
