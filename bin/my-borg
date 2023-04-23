@@ -362,6 +362,10 @@ class Archive(object):
 	def backup_interval(self):
 		return parse_interval(self.config['interval'])
 
+	@property
+	def glob(self):
+		return self.prefix + '*'
+
 def prune_archive(archive, keep):
 	assert isinstance(archive, Archive)
 	keep_args = []
@@ -377,7 +381,7 @@ def prune_archive(archive, keep):
 			# '--keep-hourly', '1',
 			'--keep-daily', '7',
 			# '--keep-weekly', '3',
-			'--prefix', archive.prefix,
+			'--glob-archives', archive.glob,
 			archive.repo.path
 		)
 
@@ -385,7 +389,7 @@ def check_archive(archive, num_to_check):
 	check_borg_call('borg',
 		'check',
 		'--last', string_of_int(num_to_check),
-		'--prefix', archive.prefix,
+		'--glob-archives', archive.glob,
 		archive.repo.path)
 
 def check_repo(repo):
