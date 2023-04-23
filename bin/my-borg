@@ -548,7 +548,7 @@ def main():
 			action(repo)
 
 	if skipped_repos:
-		raise Skip("Skipped paths: %r" % (skipped_repos))
+		raise Skip("Skipped paths: %r" % ([r.path for r in skipped_repos]))
 
 try:
 	mark_progress()
