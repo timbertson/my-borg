@@ -163,11 +163,18 @@ class Repo(object):
 			for archive in self.config['archives']
 		]
 
+	def __repr__(self):
+		return "Repo(%r, %r)" % (self.config, self.global_config)
+
 	def path_exists(self):
-		if '@' in self.path:
-			return True # remote path
+		if self.is_remote:
+			return True
 		else:
 			return os.path.exists(self.path)
+
+	@property
+	def is_remote(self):
+		return '@' in self.path
 
 	@property
 	def identity(self):
@@ -388,7 +395,9 @@ def check_repo(repo):
 def sync_repo(repo, generations):
 	print("\n\n ==== sync: %s ====" % (repo.name,))
 	config = repo.sync_config
-	if config is False:
+	# NOTE: sync is only needed if we backup to a local file.
+	# Skip this vy default when `path` is remote
+	if (config is None and repo.is_remote) or (config is False):
 		print("...skipping %s" % repo.path)
 		return
 	config_file = os.path.join(confdir, config['config'])
